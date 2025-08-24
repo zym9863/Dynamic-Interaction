@@ -68,6 +68,10 @@ Dynamic Interaction 是一个基于多元时间序列分析的经济数据动态
 **技术复杂度**：中等
 **预期时间**：2周
 
+进展：已在 `dynamic_interaction_analysis.py` 中新增 `enhanced_diagnostics()`：
+- 已实现：残差正态性（Jarque-Bera）、ARCH 异方差检验、根模数稳定性判断、简单留出法 RMSE 评估
+- 待办：Breusch-Pagan 检验、结构突变检验、更全面的预测评估与可视化
+
 #### P0.3 数据质量检测系统
 **功能描述**：自动化数据质量监控
 - 缺失值检测和处理策略
@@ -79,6 +83,11 @@ Dynamic Interaction 是一个基于多元时间序列分析的经济数据动态
 **用户价值**：确保分析结果的准确性
 **技术复杂度**：低
 **预期时间**：1.5周
+
+进展：已新增 `validate_data()`，覆盖：
+- 缺失值统计、非数值列提示、IQR 异常值计数
+- 日期频率推断与缺口提示
+- 合并到完整流程（`run_full_analysis` 第一步后执行），结果写入 `results['data_quality']`
 
 ### P1 优先级（功能扩展）- 1-2个月内完成
 

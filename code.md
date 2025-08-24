@@ -16,7 +16,7 @@
 ### 🔴 P0 - 严重问题 (Critical)
 **需要立即修复的关键问题**
 
-#### 1. 异常处理机制缺失
+#### 1. 异常处理机制缺失 — 已修复
 **文件**: `D:\github\Dynamic-Interaction\dynamic_interaction_analysis.py`  
 **行数**: 全文  
 **问题描述**: 代码中缺乏全面的异常处理机制，特别是：
@@ -24,41 +24,26 @@
 - 数据合并操作（第50-52行）可能因数据不匹配失败
 - 统计模型估计（第281行）可能因数据质量问题失败
 
-**风险**: 程序可能因为数据问题、文件缺失或数值计算错误而崩溃
-**建议修复**:
-```python
-def load_and_merge_data(self):
-    """加载并合并所有数据集"""
-    try:
-        print("正在加载数据...")
-        
-        # 检查文件是否存在
-        required_files = ['UMCSENT.csv', 'DSPIC96.csv', 'PCE.csv', 'TOTALSL.csv']
-        for file in required_files:
-            if not os.path.exists(f"{self.data_path}{file}"):
-                raise FileNotFoundError(f"数据文件 {file} 不存在")
-        
-        # 读取数据（添加异常处理）
-        umcsent = pd.read_csv(f"{self.data_path}UMCSENT.csv")
-        # ... 其他文件读取
-        
-    except FileNotFoundError as e:
-        print(f"文件错误: {e}")
-        raise
-    except pd.errors.EmptyDataError:
-        print("数据文件为空")
-        raise
-    except Exception as e:
-        print(f"数据加载失败: {e}")
-        raise
-```
+**风险**: 程序可能因为数据问题、文件缺失或数值计算错误而崩溃  
+**修复状态**: 已在 `load_and_merge_data()` 中加入文件存在性检查、CSV读取异常捕获（包含空文件）、关键列校验、日期解析与无效行剔除，并对合并为空给出显式错误；上层流程保持异常向上抛出，避免静默失败。
 
-#### 2. 内存管理问题
+变更要点：
+- 新增 `os` 依赖，校验 `UMCSENT.csv`/`DSPIC96.csv`/`PCE.csv`/`TOTALSL.csv` 是否存在
+- 统一日期解析与无效日期清洗；防止日期列缺失
+- 合并后空集检查并报错
+- 捕获 `pd.errors.EmptyDataError` 与通用异常，向上抛出
+
+#### 2. 内存管理问题 — 已修复
 **文件**: `D:\github\Dynamic-Interaction\dynamic_interaction_analysis.py`  
 **行数**: 324, 358, 386行  
 **问题描述**: 在results字典中直接存储大型对象（模型、图形对象），可能导致内存泄漏
 **风险**: 长时间运行或处理大数据集时内存占用过高
-**建议修复**: 只存储必要的结果摘要，而不是完整的模型对象
+**修复状态**: 现仅存储轻量摘要：
+- 协整结果保存统计量与临界值数组，不保存完整对象
+- VAR模型的 `results` 中仅存 `optimal_lag/nobs/aic/bic` 与 Ljung-Box 摘要
+- IRF/FEVD 仅保存数值数组，不保存对象本身
+
+这些修改已在 `var_model_estimation/impulse_response_analysis/variance_decomposition` 中落地。
 
 ### 🟠 P1 - 高优先级 (High)
 **显著影响代码质量和维护性的问题**

@@ -9,14 +9,16 @@
 - TOTALSL: 消费者信贷总额 (百万美元)
 """
 
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from statsmodels.tsa.vector_ar.var_model import VAR
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
-from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
+from statsmodels.stats.stattools import jarque_bera
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -26,46 +28,114 @@ plt.rcParams['axes.unicode_minus'] = False
 
 class DynamicInteractionAnalysis:
     def __init__(self, data_path="./"):
-        """初始化分析类"""
+        """初始化分析类
+
+        参数:
+            data_path (str): 数据与输出文件所在目录路径
+        """
         self.data_path = data_path
         self.data = None
         self.var_model = None
         self.results = {}
+        self.data_diff = None
         
     def load_and_merge_data(self):
-        """加载并合并所有数据集"""
+        """加载并合并所有数据集（含异常处理与文件检查）
+
+        返回:
+            pd.DataFrame: 合并后的数据，索引为日期
+        异常:
+            FileNotFoundError: 当必需数据文件缺失时
+            ValueError: 当数据列缺失或合并失败时
+            Exception: 其他不可预期错误
+        """
         print("正在加载数据...")
-        
-        # 读取各个数据文件
-        umcsent = pd.read_csv(f"{self.data_path}UMCSENT.csv")
-        dspic96 = pd.read_csv(f"{self.data_path}DSPIC96.csv")
-        pce = pd.read_csv(f"{self.data_path}PCE.csv")
-        totalsl = pd.read_csv(f"{self.data_path}TOTALSL.csv")
-        
-        # 转换日期格式
-        for df in [umcsent, dspic96, pce, totalsl]:
-            df['observation_date'] = pd.to_datetime(df['observation_date'])
-        
-        # 合并数据
-        self.data = umcsent.merge(dspic96, on='observation_date', how='inner') \
-                          .merge(pce, on='observation_date', how='inner') \
-                          .merge(totalsl, on='observation_date', how='inner')
-        
-        # 设置日期为索引
-        self.data.set_index('observation_date', inplace=True)
-        
-        # 重命名列以便理解
-        self.data.columns = ['消费者信心', '实际收入', '消费支出', '信贷总额']
-        
-        print(f"数据加载完成，共{len(self.data)}个观测值")
-        print(f"时间范围: {self.data.index[0]} 到 {self.data.index[-1]}")
-        print("\n数据预览:")
-        print(self.data.head())
-        
-        return self.data
+
+        required_files = ["UMCSENT.csv", "DSPIC96.csv", "PCE.csv", "TOTALSL.csv"]
+
+        # 确保路径存在
+        for fname in required_files:
+            fpath = os.path.join(self.data_path, fname)
+            if not os.path.exists(fpath):
+                raise FileNotFoundError(f"数据文件缺失: {fpath}")
+
+        try:
+            # 读取各个数据文件
+            umcsent = pd.read_csv(os.path.join(self.data_path, "UMCSENT.csv"))
+            dspic96 = pd.read_csv(os.path.join(self.data_path, "DSPIC96.csv"))
+            pce = pd.read_csv(os.path.join(self.data_path, "PCE.csv"))
+            totalsl = pd.read_csv(os.path.join(self.data_path, "TOTALSL.csv"))
+
+            # 基本列校验
+            for name, df in {
+                "UMCSENT": umcsent,
+                "DSPIC96": dspic96,
+                "PCE": pce,
+                "TOTALSL": totalsl,
+            }.items():
+                if "observation_date" not in df.columns:
+                    raise ValueError(f"{name} 缺少 observation_date 列")
+                if df.shape[1] < 2:
+                    raise ValueError(f"{name} 数据列不足，期望2列以上")
+
+            # 转换日期格式
+            for df in [umcsent, dspic96, pce, totalsl]:
+                df["observation_date"] = pd.to_datetime(df["observation_date"], errors="coerce")
+            
+            # 丢弃无效日期
+            for name, df in {"UMCSENT": umcsent, "DSPIC96": dspic96, "PCE": pce, "TOTALSL": totalsl}.items():
+                before = len(df)
+                df.dropna(subset=["observation_date"], inplace=True)
+                after = len(df)
+                if after < before:
+                    print(f"警告: {name} 含有无效日期记录，已丢弃 {before-after} 行")
+
+            # 合并数据
+            data = umcsent.merge(dspic96, on="observation_date", how="inner") \
+                           .merge(pce, on="observation_date", how="inner") \
+                           .merge(totalsl, on="observation_date", how="inner")
+
+            if data.empty:
+                raise ValueError("合并后数据为空，请检查各文件的日期范围是否有交集")
+
+            # 设置日期为索引并重命名列
+            data.set_index("observation_date", inplace=True)
+
+            # 自动识别指标列（每个文件假定除日期列外仅一列数值列）
+            cols = []
+            for df, cname in [
+                (umcsent, "消费者信心"),
+                (dspic96, "实际收入"),
+                (pce, "消费支出"),
+                (totalsl, "信贷总额"),
+            ]:
+                value_cols = [c for c in df.columns if c != "observation_date"]
+                if not value_cols:
+                    raise ValueError("无法识别数值列")
+                cols.append(value_cols[0])
+
+            # 重命名到统一中文名
+            data.columns = ["消费者信心", "实际收入", "消费支出", "信贷总额"] if len(data.columns) == 4 else data.columns
+
+            self.data = data
+
+            print(f"数据加载完成，共{len(self.data)}个观测值")
+            print(f"时间范围: {self.data.index[0]} 到 {self.data.index[-1]}")
+            print("\n数据预览:")
+            print(self.data.head())
+            return self.data
+
+        except pd.errors.EmptyDataError as e:
+            raise ValueError(f"读取到空数据文件: {e}") from e
+        except Exception as e:
+            # 将异常抛出，以便上层感知
+            raise
     
     def descriptive_statistics(self):
-        """描述性统计分析"""
+        """描述性统计分析
+
+        生成基础统计、时间序列图与相关性热力图，并将相关性矩阵保存到 results。
+        """
         print("\n" + "="*50)
         print("描述性统计分析")
         print("="*50)
@@ -103,9 +173,71 @@ class DynamicInteractionAnalysis:
         plt.show()
         
         self.results['correlation_matrix'] = correlation_matrix
+
+    def validate_data(self):
+        """数据质量验证（缺失/类型/异常值/日期连续性）
+
+        返回:
+            dict: 数据质量报告，包括缺失值计数、异常值计数等
+        """
+        print("\n" + "="*50)
+        print("数据质量检测")
+        print("="*50)
+
+        report = {
+            "missing": self.data.isnull().sum().to_dict(),
+            "outliers": {},
+            "date_freq": None,
+            "non_numeric": [],
+        }
+
+        # 非数值列（除索引外）检查
+        non_numeric_cols = self.data.select_dtypes(include=[object]).columns.tolist()
+        for col in non_numeric_cols:
+            report["non_numeric"].append(col)
+            print(f"警告: 列 {col} 含非数值类型")
+
+        # 缺失值报告
+        if any(v > 0 for v in report["missing"].values()):
+            print(f"发现缺失值: {report['missing']}")
+        else:
+            print("未发现缺失值")
+
+        # 异常值（IQR）
+        for col in self.data.select_dtypes(include=[np.number]).columns:
+            Q1 = self.data[col].quantile(0.25)
+            Q3 = self.data[col].quantile(0.75)
+            IQR = Q3 - Q1
+            outliers = ((self.data[col] < (Q1 - 1.5 * IQR)) | (self.data[col] > (Q3 + 1.5 * IQR))).sum()
+            report["outliers"][col] = int(outliers)
+            if outliers > 0:
+                print(f"{col} 发现 {outliers} 个潜在异常值")
+
+        # 日期频率与连续性检查（按月）
+        try:
+            inferred = pd.infer_freq(self.data.index)
+            report["date_freq"] = inferred
+            if inferred is None:
+                print("提示: 无法推断固定频率，可能存在日期缺口")
+            else:
+                # 简要缺口检查
+                full_range = pd.date_range(self.data.index.min(), self.data.index.max(), freq=inferred)
+                missing_dates = full_range.difference(self.data.index)
+                if len(missing_dates) > 0:
+                    print(f"日期缺口数量: {len(missing_dates)}")
+        except Exception:
+            print("日期频率推断失败")
+
+        self.results["data_quality"] = report
+        return report
     
     def stationarity_test(self):
-        """平稳性检验"""
+        """平稳性检验（ADF）
+
+        对每个变量进行ADF检验，并在必要时自动构造一阶差分数据。
+        返回:
+            dict: 每个变量的ADF统计与结论
+        """
         print("\n" + "="*50)
         print("平稳性检验 (ADF检验)")
         print("="*50)
@@ -190,9 +322,13 @@ class DynamicInteractionAnalysis:
         
         print(f"\n在95%显著性水平下，协整关系个数: {cointegration_rank}")
         
+        # 仅保存必要的摘要，避免存储大型对象
         self.results['cointegration'] = {
-            'johansen_result': result,
-            'cointegration_rank': cointegration_rank
+            'trace_stats': result.lr1.tolist(),
+            'trace_crit_95': result.cvt[:, 1].tolist(),
+            'maxeig_stats': result.lr2.tolist(),
+            'maxeig_crit_95': result.cvm[:, 1].tolist(),
+            'cointegration_rank': int(cointegration_rank)
         }
         
         return result
@@ -253,45 +389,50 @@ class DynamicInteractionAnalysis:
         return causality_results
     
     def var_model_estimation(self):
-        """VAR模型估计"""
+        """VAR模型估计
+
+        自动选择滞后阶，拟合模型并执行基础残差诊断。仅在results中保存轻量摘要。
+        返回:
+            VARResults: 拟合后的VAR模型
+        """
         print("\n" + "="*50)
         print("VAR模型估计")
         print("="*50)
-        
+
         # 确定使用的数据
-        if hasattr(self, 'data_diff'):
+        if hasattr(self, 'data_diff') and self.data_diff is not None:
             model_data = self.data_diff
             print("使用一阶差分数据建立VAR模型")
         else:
             model_data = self.data
             print("使用原始数据建立VAR模型")
-        
+
         # 确定最优滞后期
         model = VAR(model_data)
         lag_selection = model.select_order(maxlags=8)
-        
+
         print("\n滞后期选择结果:")
         print(lag_selection.summary())
-        
+
         # 选择AIC最小的滞后期
-        optimal_lag = lag_selection.aic
+        optimal_lag = int(lag_selection.aic)
         print(f"\n根据AIC准则选择最优滞后期: {optimal_lag}")
-        
+
         # 估计VAR模型
         self.var_model = model.fit(optimal_lag)
-        
+
         print(f"\nVAR({optimal_lag})模型估计结果:")
         print(self.var_model.summary())
-        
+
         # 模型诊断
         print("\n模型诊断:")
-        
+
         # 残差序列相关性检验
         ljung_box_results = {}
         residuals = self.var_model.resid
         for i, col in enumerate(model_data.columns):
             lb_result = acorr_ljungbox(residuals.iloc[:, i], lags=10, return_df=False)
-            
+
             # 处理不同版本的statsmodels返回值
             if isinstance(lb_result, tuple) and len(lb_result) == 2:
                 lb_stat, lb_pvalue = lb_result
@@ -312,83 +453,116 @@ class DynamicInteractionAnalysis:
                     # 尝试直接转换
                     lb_stat_val = float(lb_result)
                     lb_pvalue_val = 0.05  # 默认值
-            
+
             ljung_box_results[col] = {'statistic': lb_stat_val, 'p_value': lb_pvalue_val}
-            
+
             if lb_pvalue_val > 0.05:
                 print(f"  {col}残差: 无序列相关性 (Ljung-Box p值: {lb_pvalue_val:.4f})")
             else:
                 print(f"  {col}残差: 存在序列相关性 (Ljung-Box p值: {lb_pvalue_val:.4f})")
-        
+
+        # 只保存必要摘要，避免大型对象
         self.results['var_model'] = {
-            'model': self.var_model,
-            'optimal_lag': optimal_lag,
-            'ljung_box': ljung_box_results
+            'optimal_lag': int(optimal_lag),
+            'nobs': int(self.var_model.nobs),
+            'aic': float(self.var_model.aic) if hasattr(self.var_model, 'aic') else None,
+            'bic': float(self.var_model.bic) if hasattr(self.var_model, 'bic') else None,
+            'ljung_box': ljung_box_results,
         }
-        
+
         return self.var_model
     
     def impulse_response_analysis(self):
-        """脉冲响应分析"""
+        """脉冲响应分析
+
+        计算标准与正交化脉冲响应，绘图并在results保存轻量数值数组。
+        返回:
+            Irf: statsmodels 的 IRF 对象（不存入results以节省内存）
+        """
         print("\n" + "="*50)
         print("脉冲响应分析")
         print("="*50)
-        
+
         if self.var_model is None:
             print("请先估计VAR模型")
             return
-        
+
         # 计算脉冲响应函数
         irf = self.var_model.irf(periods=10)
-        
+
         # 绘制脉冲响应图
         fig = irf.plot(orth=False, figsize=(15, 12))
         plt.suptitle('脉冲响应函数图', fontsize=16)
         plt.tight_layout()
         plt.savefig(f'{self.data_path}脉冲响应图.png', dpi=300, bbox_inches='tight')
         plt.show()
-        
+
         # 正交化脉冲响应
         fig = irf.plot(orth=True, figsize=(15, 12))
         plt.suptitle('正交化脉冲响应函数图', fontsize=16)
         plt.tight_layout()
         plt.savefig(f'{self.data_path}正交化脉冲响应图.png', dpi=300, bbox_inches='tight')
         plt.show()
-        
-        self.results['impulse_response'] = irf
-        
+
+        # 仅保存轻量数组
+        try:
+            self.results['impulse_response'] = {
+                'periods': 10,
+                'irfs': irf.irfs.tolist(),           # shape: (periods+1, k, k)
+                'orth_irfs': irf.orth_irfs.tolist()  # shape: (periods+1, k, k)
+            }
+        except Exception:
+            self.results['impulse_response'] = {'periods': 10}
+
         return irf
     
     def variance_decomposition(self):
-        """方差分解分析"""
+        """方差分解分析
+
+        进行FEVD并绘图，在results中仅保存分解矩阵。
+        返回:
+            FEVD: statsmodels 的 FEVD 对象（不存入results以节省内存）
+        """
         print("\n" + "="*50)
         print("方差分解分析")
         print("="*50)
-        
+
         if self.var_model is None:
             print("请先估计VAR模型")
             return
-        
+
         # 计算方差分解
         fevd = self.var_model.fevd(periods=10)
-        
+
         # 输出方差分解结果
         print("\n方差分解结果 (10期预测):")
         print(fevd.summary())
-        
+
         # 绘制方差分解图
         fig = fevd.plot(figsize=(15, 10))
         plt.suptitle('方差分解图', fontsize=16)
         plt.tight_layout()
         plt.savefig(f'{self.data_path}方差分解图.png', dpi=300, bbox_inches='tight')
         plt.show()
-        
-        self.results['variance_decomposition'] = fevd
-        
+
+        # 仅保存轻量数组
+        try:
+            self.results['variance_decomposition'] = {
+                'periods': 10,
+                'decomp': fevd.decomp.tolist()
+            }
+        except Exception:
+            self.results['variance_decomposition'] = {'periods': 10}
+
         return fevd
     
     def generate_report(self):
-        """生成分析报告"""
+        """生成分析报告
+
+        汇总各步骤分析结果，输出到文本文件。
+        返回:
+            str: 报告文本
+        """
         print("\n" + "="*50)
         print("分析报告总结")
         print("="*50)
@@ -463,6 +637,14 @@ class DynamicInteractionAnalysis:
             if not causality_found:
                 report.append(f"   - 在5%显著性水平下未发现显著的格兰杰因果关系")
         
+        # 模型增强诊断（如已计算）
+        if 'diagnostics' in self.results:
+            diag = self.results['diagnostics']
+            report.append(f"\n7. 模型诊断增强")
+            report.append(f"   - 残差正态性(JB)显著比例: {diag.get('jb_significant_ratio', 'N/A')}")
+            report.append(f"   - 异方差(ARCH)显著比例: {diag.get('arch_significant_ratio', 'N/A')}")
+            report.append(f"   - 模型稳定性: {'稳定' if diag.get('is_stable', False) else '不稳定'}")
+
         # 政策建议
         report.append(f"\n7. 政策建议")
         report.append(f"   - 基于模型结果，建议关注各变量间的动态相互作用")
@@ -480,37 +662,46 @@ class DynamicInteractionAnalysis:
         return report_text
     
     def run_full_analysis(self):
-        """运行完整分析流程"""
+        """运行完整分析流程
+
+        步骤: 加载与合并 -> 数据质量 -> 描述统计 -> 平稳性 -> 协整 -> 因果 -> VAR估计 -> IRF -> FEVD -> 报告
+        """
         print("开始进行消费者信心、收入、信贷状况与实际消费支出动态相互作用分析")
         print("="*70)
-        
+
         # 1. 加载数据
         self.load_and_merge_data()
-        
+
+        # 1.1 数据质量
+        self.validate_data()
+
         # 2. 描述性统计
         self.descriptive_statistics()
-        
+
         # 3. 平稳性检验
         self.stationarity_test()
-        
+
         # 4. 协整检验
         self.cointegration_test()
-        
+
         # 5. 格兰杰因果关系检验
         self.granger_causality_test()
-        
+
         # 6. VAR模型估计
         self.var_model_estimation()
-        
+
+        # 6.1 模型增强诊断
+        self.enhanced_diagnostics()
+
         # 7. 脉冲响应分析
         self.impulse_response_analysis()
-        
+
         # 8. 方差分解
         self.variance_decomposition()
-        
+
         # 9. 生成报告
         self.generate_report()
-        
+
         print("\n分析完成！")
         print("生成的文件:")
         print("- 时间序列图.png")
@@ -519,6 +710,77 @@ class DynamicInteractionAnalysis:
         print("- 正交化脉冲响应图.png")
         print("- 方差分解图.png")
         print("- 分析报告.txt")
+
+    def enhanced_diagnostics(self):
+        """增强模型诊断（正态性、异方差、稳定性、预测评估）
+
+        基于VAR残差进行Jarque-Bera正态性检验、ARCH异方差检验；
+        使用根模数判断稳定性；并给出简单的滚动预测精度评估（RMSE）。
+        """
+        if self.var_model is None:
+            print("请先估计VAR模型")
+            return
+
+        residuals = self.var_model.resid
+        k = residuals.shape[1]
+
+        jb_sig = 0
+        arch_sig = 0
+        jb_results = {}
+        arch_results = {}
+
+        for col in residuals.columns:
+            # Jarque-Bera 正态性
+            try:
+                jb_stat, jb_pvalue, _, _ = jarque_bera(residuals[col])
+                jb_results[col] = {"stat": float(jb_stat), "p_value": float(jb_pvalue)}
+                if jb_pvalue < 0.05:
+                    jb_sig += 1
+            except Exception:
+                jb_results[col] = {"stat": None, "p_value": None}
+
+            # ARCH 异方差（滞后10）
+            try:
+                arch_stat, arch_pvalue, _, _ = het_arch(residuals[col], nlags=10)
+                arch_results[col] = {"stat": float(arch_stat), "p_value": float(arch_pvalue)}
+                if arch_pvalue < 0.05:
+                    arch_sig += 1
+            except Exception:
+                arch_results[col] = {"stat": None, "p_value": None}
+
+        # 稳定性（所有根模数 < 1）
+        try:
+            is_stable = bool(self.var_model.is_stable(verbose=False)) if hasattr(self.var_model, 'is_stable') else np.all(np.abs(self.var_model.roots) < 1)
+        except Exception:
+            is_stable = False
+
+        diag = {
+            "jb": jb_results,
+            "arch": arch_results,
+            "jb_significant_ratio": round(jb_sig / k, 3) if k else None,
+            "arch_significant_ratio": round(arch_sig / k, 3) if k else None,
+            "is_stable": is_stable,
+        }
+
+        # 简单预测评估（留出末尾12期，如不足则取 len//5）
+        try:
+            total_n = len(self.data)
+            holdout = max(6, min(12, total_n // 5))
+            if holdout >= 4 and total_n - holdout > 20:
+                model_data = self.data_diff if self.data_diff is not None else self.data
+                train = model_data.iloc[:-holdout]
+                test = model_data.iloc[-holdout:]
+                model = VAR(train)
+                lag = int(self.results.get('var_model', {}).get('optimal_lag', 1))
+                fitted = model.fit(lag)
+                fc = fitted.forecast(train.values[-lag:], steps=holdout)
+                fc = pd.DataFrame(fc, index=test.index, columns=test.columns)
+                rmse = ((fc - test) ** 2).mean().pow(0.5).to_dict()
+                diag["forecast_rmse"] = {k: float(v) for k, v in rmse.items()}
+        except Exception:
+            pass
+
+        self.results['diagnostics'] = diag
 
 
 if __name__ == "__main__":
